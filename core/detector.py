@@ -154,7 +154,8 @@ class RandBox(nn.Module):
             cfg=cfg, cost_class=class_weight, cost_bbox=l1_weight, cost_giou=giou_weight
         )
         weight_dict = {"loss_ce": class_weight, "loss_bbox": l1_weight, "loss_giou": giou_weight,
-                       "loss_nc_ce": nc_weight, "loss_decorr": decorr_weight, "loss_rpn_cls":1.0, "loss_rpn_loc":1.0}
+                       "loss_nc_ce": nc_weight, "loss_decorr": decorr_weight, "loss_ufdm": 1,
+                       "loss_rpn_cls":1.0, "loss_rpn_loc":1.0}
         if self.deep_supervision:
             aux_weight_dict = {}
             for i in range(self.num_heads - 1):
@@ -164,6 +165,7 @@ class RandBox(nn.Module):
         losses = ["labels", "boxes"]
         if cfg.MODEL.NC:
             losses += ["nc_labels"]
+            losses += ["ufdm"]
             # losses += ["nc_labels", "objectness"]
             # losses += ["nc_labels", "obj_likelihood"]
         if decorr_weight > 0:
@@ -200,7 +202,7 @@ class RandBox(nn.Module):
 
         x_boxes = box_cxcywh_to_xyxy(x_boxes)
         x_boxes = x_boxes * images_whwh[:, None, :]
-        outputs_class, outputs_objectness, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
+        outputs_class, outputs_objectness, outputs_coord, outputs_feat = self.head(backbone_feats, x_boxes, t, None)
 
         x_start = outputs_coord[-1]  # (batch, num_proposals, 4) predict boxes: absolute coordinates (x1, y1, x2, y2)
         x_start = x_start / images_whwh[:, None, :]
@@ -382,8 +384,13 @@ class RandBox(nn.Module):
             t = t.squeeze(-1)
             x_boxes = x_boxes * images_whwh[:, None, :]#将边界框坐标修正为绝对坐标
 
-            outputs_class, output_objectness, outputs_coord = self.head(features, x_boxes, t, None)
-            output = {'pred_logits': outputs_class[-1], 'pred_objectness': output_objectness[-1], 'pred_boxes': outputs_coord[-1]}
+            outputs_class, output_objectness, outputs_coord, outputs_feat = self.head(features, x_boxes, t, None)
+            output = {
+                'pred_logits': outputs_class[-1],
+                'pred_objectness': output_objectness[-1],
+                'pred_boxes': outputs_coord[-1],
+                'pred_features': outputs_feat[-1]
+            }
             # # 将字典保存到 .txt 文件
             # if self.count % 100 == 0:
             #     with open('data.txt', 'a') as f:
@@ -399,8 +406,8 @@ class RandBox(nn.Module):
             #             f.write("\n")  # 添加空行分隔
             # self.count += 1
             if self.deep_supervision:
-                output['aux_outputs'] = [{'pred_logits': a, 'pred_objectness': b, 'pred_boxes': c}
-                                         for a, b, c in zip(outputs_class[:-1], output_objectness[:-1], outputs_coord[:-1])]
+                output['aux_outputs'] = [{'pred_logits': a, 'pred_objectness': b, 'pred_boxes': c, 'pred_features': d}
+                                         for a, b, c, d in zip(outputs_class[:-1], output_objectness[:-1], outputs_coord[:-1], outputs_feat[:-1])]
             loss_dict = self.criterion(output, targets,x_boxes, gt_instances)
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
@@ -497,6 +504,12 @@ class RandBox(nn.Module):
             image_size_xyxy_tgt = image_size_xyxy.unsqueeze(0).repeat(len(gt_boxes), 1)
             target["image_size_xyxy_tgt"] = image_size_xyxy_tgt.to(self.device)
             target["area"] = targets_per_image.gt_boxes.area().to(self.device)
+
+            if targets_per_image.has("gt_scores"):
+                target["scores"] = targets_per_image.gt_scores.to(self.device)
+            else:
+                target["scores"] = torch.ones((len(gt_boxes),), dtype=torch.float32, device=self.device)
+
             new_targets.append(target)
 
         return new_targets, torch.stack(diffused_boxes), torch.stack(noises), torch.stack(ts)

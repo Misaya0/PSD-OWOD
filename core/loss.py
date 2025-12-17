@@ -55,6 +55,27 @@ class SetCriterionDynamicK(nn.Module):
         self.batch_size_per_image = 256
         self.loss_weight = {'loss_rpn_cls': 0.1}
 
+        # ---------------- UFDM (paper-aligned) ----------------
+        self.ufdm_dim = hidden_dim
+        self.ufdm_gamma = getattr(cfg.MODEL, "UFDM_GAMMA", 2.0)  # s = r^gamma
+        self.ufdm_tau_min = getattr(cfg.MODEL, "UFDM_TAU_MIN", 0.05)  # clip weight
+        self.ufdm_ae_weight = getattr(cfg.MODEL, "UFDM_AE_WEIGHT", 1.0)  # AE reconstruction loss weight
+        self.ufdm_bg_samples = getattr(cfg.MODEL, "UFDM_BG_SAMPLES", 256)
+        self.ufdm_fit_min_n = getattr(cfg.MODEL, "UFDM_FIT_MIN_N", 32)
+
+        # AE: simple MLP autoencoder
+        h = max(self.ufdm_dim // 2, 64)
+        z = max(self.ufdm_dim // 4, 32)
+        self.ufdm_enc = nn.Sequential(nn.Linear(self.ufdm_dim, h), nn.ReLU(inplace=True), nn.Linear(h, z))
+        self.ufdm_dec = nn.Sequential(nn.Linear(z, h), nn.ReLU(inplace=True), nn.Linear(h, self.ufdm_dim))
+
+        # Weibull params (EMA-updated)
+        self.register_buffer("ufdm_k_fg", torch.tensor(2.0))
+        self.register_buffer("ufdm_l_fg", torch.tensor(1.0))
+        self.register_buffer("ufdm_k_bg", torch.tensor(2.0))
+        self.register_buffer("ufdm_l_bg", torch.tensor(1.0))
+        self.ufdm_param_m = getattr(cfg.MODEL, "UFDM_PARAM_MOMENTUM", 0.9)
+
     def loss_labels(self, outputs, targets, indices):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -311,6 +332,192 @@ class SetCriterionDynamicK(nn.Module):
         #     return {'loss_pos_obj_ll': loss_pos_obj_ll * lr_decay, 'loss_neg_obj_ll': loss_neg_obj_ll * lr_decay,
         #             'loss_pseudo_obj_ll': loss_pseudo_obj_ll * lr_decay}
 
+    def loss_ufdm(self, outputs, targets, indices, owod_targets, owod_indices):
+        if ("pred_features" not in outputs) or (owod_targets is None) or (len(owod_indices) == 0):
+            return {"loss_ufdm": outputs["pred_boxes"].sum() * 0.0}
+
+        feats = outputs["pred_features"]  # (bs, Q, d)
+        bs, Q, d = feats.shape
+        device = feats.device
+
+        # -------- collect fg (known matched), bg (unmatched), unk (unknown matched) features --------
+        fg_list, bg_list, unk_list = [], [], []
+        for b in range(bs):
+            # known matched queries
+            sel_k = indices[b][0]
+            if sel_k.dtype == torch.bool:
+                qk = torch.nonzero(sel_k, as_tuple=False).squeeze(1)
+            else:
+                qk = sel_k
+
+            # unknown matched queries
+            sel_u = owod_indices[b][0]
+            if sel_u.dtype == torch.bool:
+                qu = torch.nonzero(sel_u, as_tuple=False).squeeze(1)
+            else:
+                qu = sel_u
+
+            if qk.numel() > 0:
+                fg_list.append(feats[b, qk])
+
+            if qu.numel() > 0:
+                unk_list.append(feats[b, qu])
+
+            # background = queries not in (known matched ∪ unknown matched)
+            mask_bg = torch.ones((Q,), dtype=torch.bool, device=device)
+            if qk.numel() > 0:
+                mask_bg[qk] = False
+            if qu.numel() > 0:
+                mask_bg[qu] = False
+            qb = torch.nonzero(mask_bg, as_tuple=False).squeeze(1)
+
+            if qb.numel() > 0:
+                # sample a fixed number for stability
+                m = min(qb.numel(), self.ufdm_bg_samples)
+                qb = qb[torch.randperm(qb.numel(), device=device)[:m]]
+                bg_list.append(feats[b, qb])
+
+        if (len(unk_list) == 0) or (len(fg_list) == 0) or (len(bg_list) == 0):
+            return {"loss_ufdm": outputs["pred_boxes"].sum() * 0.0}
+
+        F_fg = torch.cat(fg_list, dim=0)  # (Nfg, d)
+        F_bg = torch.cat(bg_list, dim=0)  # (Nbg, d)
+        F_uk = torch.cat(unk_list, dim=0)  # (Nuk, d)
+
+        # -------- AE forward & reconstruction error --------
+        def ae_recon(x):
+            z = self.ufdm_enc(x)
+            xh = self.ufdm_dec(z)
+            return xh
+
+        # normalize feature like paper’s “object-level features” typically stabilized
+        F_fg_n = F.normalize(F_fg, dim=-1)
+        F_bg_n = F.normalize(F_bg, dim=-1)
+        F_uk_n = F.normalize(F_uk, dim=-1)
+
+        R_fg = ae_recon(F_fg_n)
+        R_bg = ae_recon(F_bg_n)
+        R_uk = ae_recon(F_uk_n)
+
+        # reconstruction error: L2 norm per sample
+        e_fg = torch.norm(F_fg_n - R_fg, dim=-1)  # (Nfg,)
+        e_bg = torch.norm(F_bg_n - R_bg, dim=-1)  # (Nbg,)
+        e_uk = torch.norm(F_uk_n - R_uk, dim=-1)  # (Nuk,)
+
+        # AE loss (train AE)
+        loss_ae = (
+                F.mse_loss(R_fg, F_fg_n, reduction="mean") +
+                F.mse_loss(R_bg, F_bg_n, reduction="mean") +
+                F.mse_loss(R_uk, F_uk_n, reduction="mean")
+        )
+
+        # -------- fit/update Weibull params (EMA) --------
+        with torch.no_grad():
+            self._update_weibull_params(e_fg, e_bg)
+
+        # -------- compute unknown soft weights from fg/bg pdf ratio --------
+        p_fg = self._weibull_pdf(e_uk, self.ufdm_k_fg, self.ufdm_l_fg)
+        p_bg = self._weibull_pdf(e_uk, self.ufdm_k_bg, self.ufdm_l_bg)
+        r = p_fg / (p_fg + p_bg + 1e-6)  # (Nuk,)
+        s = torch.clamp(r ** self.ufdm_gamma, min=self.ufdm_tau_min, max=1.0)
+
+        # -------- weighted unknown classification loss (paper: use soft label/weight to reweight pseudo unknown supervision) --------
+        # build logits for the matched unknown queries
+        if self.disentangled == 0:
+            logits = outputs["pred_logits"]  # (bs,Q,C)
+        else:
+            src_prob = torch.softmax(outputs["pred_logits"], dim=-1) * outputs["pred_objectness"]
+            logits = torch.log(src_prob / (1 - src_prob + 1e-6))
+
+        # gather unknown matched logits and targets
+        logit_list = []
+        tgt_list = []
+        for b in range(bs):
+            sel_u = owod_indices[b][0]
+            gt_i = owod_indices[b][1]
+            if sel_u.dtype == torch.bool:
+                qu = torch.nonzero(sel_u, as_tuple=False).squeeze(1)
+            else:
+                qu = sel_u
+            if (qu.numel() == 0) or (gt_i.numel() == 0):
+                continue
+            logit_list.append(logits[b, qu])  # (nu, C)
+
+            # labels from unknown targets
+            y = owod_targets[b]["labels"][gt_i]  # usually all 80
+            tgt_list.append(y)
+
+        if len(logit_list) == 0:
+            loss_nc = logits.sum() * 0.0
+        else:
+            L = torch.cat(logit_list, dim=0)  # (Nuk, C)
+            y = torch.cat(tgt_list, dim=0)  # (Nuk,)
+            C = L.shape[-1]
+            y_onehot = torch.zeros((L.shape[0], C), device=device, dtype=L.dtype)
+            y_onehot.scatter_(1, y.unsqueeze(1), 1.0)
+
+            # focal loss per-sample
+            per = sigmoid_focal_loss_jit(
+                L, y_onehot,
+                alpha=self.focal_loss_alpha,
+                gamma=self.focal_loss_gamma,
+                reduction="none"
+            ).sum(dim=-1)  # (Nuk,)
+
+            # apply UFDM soft weights
+            loss_nc = (per * s).mean()
+
+        loss_total = loss_nc + self.ufdm_ae_weight * loss_ae
+        return {"loss_ufdm": loss_total}
+
+    def _weibull_pdf(self, e: torch.Tensor, k: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
+        # e>0
+        eps = 1e-6
+        e = torch.clamp(e, min=eps)
+        k = torch.clamp(k, min=eps)
+        lam = torch.clamp(lam, min=eps)
+        x = e / lam
+        return (k / lam) * torch.pow(x, k - 1.0) * torch.exp(-torch.pow(x, k))
+
+    @torch.no_grad()
+    def _fit_weibull_linear(self, e_cpu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Linear-regression fit on Weibull plot:
+          y = log(-log(1-F)) = k*log(e) - k*log(lam)
+        Return (k, lam)
+        """
+        e = e_cpu.detach().float().cpu()
+        e = e[e > 1e-8]
+        n = e.numel()
+        if n < self.ufdm_fit_min_n:
+            return None, None
+        e, _ = torch.sort(e)
+        # median rank
+        i = torch.arange(1, n + 1, dtype=torch.float32)
+        F = (i - 0.3) / (n + 0.4)
+        F = torch.clamp(F, 1e-6, 1 - 1e-6)
+        x = torch.log(e)
+        y = torch.log(-torch.log(1 - F))
+        # least squares: y = a*x + b
+        x_mean = x.mean()
+        y_mean = y.mean()
+        a = ((x - x_mean) * (y - y_mean)).sum() / (((x - x_mean) ** 2).sum() + 1e-6)
+        b = y_mean - a * x_mean
+        k = torch.clamp(a, min=0.3, max=10.0)
+        lam = torch.exp(-b / (k + 1e-6))
+        lam = torch.clamp(lam, min=1e-3, max=1e3)
+        return k.to(self.ufdm_k_fg.device), lam.to(self.ufdm_l_fg.device)
+
+    @torch.no_grad()
+    def _update_weibull_params(self, e_fg: torch.Tensor, e_bg: torch.Tensor):
+        k_fg, l_fg = self._fit_weibull_linear(e_fg)
+        k_bg, l_bg = self._fit_weibull_linear(e_bg)
+        if (k_fg is not None) and (l_fg is not None):
+            self.ufdm_k_fg = self.ufdm_param_m * self.ufdm_k_fg + (1 - self.ufdm_param_m) * k_fg
+            self.ufdm_l_fg = self.ufdm_param_m * self.ufdm_l_fg + (1 - self.ufdm_param_m) * l_fg
+        if (k_bg is not None) and (l_bg is not None):
+            self.ufdm_k_bg = self.ufdm_param_m * self.ufdm_k_bg + (1 - self.ufdm_param_m) * k_bg
+            self.ufdm_l_bg = self.ufdm_param_m * self.ufdm_l_bg + (1 - self.ufdm_param_m) * l_bg
     def _get_src_single_permutation_idx(self, indices, index):
         ## Only need the src query index selection from this function for attention feature selection
         batch_idx = [torch.full_like(src, i) for i, src in enumerate(indices)][0]
@@ -334,11 +541,14 @@ class SetCriterionDynamicK(nn.Module):
             'boxes': self.loss_boxes,
             'nc_labels': self.loss_nc_labels,
             'decorr': self.loss_decorr,
-            'obj_likelihood': self.loss_obj_likelihood
+            # 'obj_likelihood': self.loss_obj_likelihood
+            'ufdm': self.loss_ufdm,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         if loss == 'obj_likelihood':
             return loss_map[loss](outputs, targets, indices, num_boxes, num_pseudo_boxes, lvl, owod_targets, owod_indices, **kwargs)
+        elif loss == 'ufdm':
+            return loss_map[loss](outputs, targets, indices, owod_targets, owod_indices)
         return loss_map[loss](outputs, targets, indices)
     def _filter_invalid(self, boxes):
         return (boxes[:, 2] > 0) & (boxes[:, 3] > 0)
@@ -380,7 +590,7 @@ class SetCriterionDynamicK(nn.Module):
                 anchor. Values are undefined for those anchors not labeled as 1.
         """
         anchors = Boxes.cat(anchors)
-        # anchors_list = [Boxes(anchor) for anchor in anchors]
+        anchors_list = [Boxes(anchor) for anchor in anchors]
 
         gt_boxes = [x.gt_boxes for x in gt_instances]
         image_sizes = [x.image_size for x in gt_instances]
@@ -551,12 +761,17 @@ class SetCriterionDynamicK(nn.Module):
             if loss == 'nc_labels':
                 if self.start_count > self.start_iter:
                     losses.update(self.get_loss(loss, outputs, unknown_targets, ow_indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, new_ow_indices))
+            elif loss == 'ufdm':
+                # UFDM：必须用 unknown_targets + ow_indices（不能用 new_ow_indices）
+                if self.start_count > self.start_iter:
+                    losses.update(self.get_loss(loss, outputs, targets, indices,
+                                                num_boxes, num_pseudo_boxes, 5, unknown_targets, ow_indices))
             # elif loss == 'objectness':
             #     losses.update(self.losses_objetness(x_boxes, outputs['pred_objectness'], outputs['pred_boxes'], gt_labels, gt_boxes, soft_labels, gt_classes))
-            elif loss == 'obj_likelihood':
-                losses.update(self.get_loss(loss, outputs, targets, new_indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, new_ow_indices))
+            # elif loss == 'obj_likelihood':
+            #     losses.update(self.get_loss(loss, outputs, targets, new_indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, new_ow_indices))
             else:
-                losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, new_ow_indices))
+                losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, ow_indices))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -573,11 +788,15 @@ class SetCriterionDynamicK(nn.Module):
                     #                           gt_boxes, soft_labels, gt_classes)
                         l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                         losses.update(l_dict)
-                    elif loss == 'obj_likelihood':
-                        l_dict = self.get_loss(loss, aux_outputs, targets, new_indices, num_boxes, num_pseudo_boxes, 5,
-                                                    unknown_targets, new_ow_indices)
+                    elif loss == 'ufdm':
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, num_pseudo_boxes, 5, unknown_targets, ow_indices)
                         l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                         losses.update(l_dict)
+                    # elif loss == 'obj_likelihood':
+                    #     l_dict = self.get_loss(loss, aux_outputs, targets, new_indices, num_boxes, num_pseudo_boxes, 5,
+                    #                                 unknown_targets, new_ow_indices)
+                    #     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                    #     losses.update(l_dict)
                     else:
                         l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, new_ow_indices)
                         l_dict = {k + f'_{i}': v for k, v in l_dict.items()}

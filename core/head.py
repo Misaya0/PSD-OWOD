@@ -93,6 +93,7 @@ class DynamicHead(nn.Module):
         inter_class_logits = []
         inter_objectness = []
         inter_pred_bboxes = []
+        inter_features = []
 
         bs = len(features[0])
         bboxes = init_bboxes  # 生成的候选框
@@ -119,12 +120,13 @@ class DynamicHead(nn.Module):
                 inter_class_logits.append(class_logits)
                 inter_objectness.append(objectness)
                 inter_pred_bboxes.append(pred_bboxes)
+                inter_features.append(proposal_features)
             bboxes = pred_bboxes.detach()
 
         if self.return_intermediate:
-            return torch.stack(inter_class_logits), torch.stack(inter_objectness), torch.stack(inter_pred_bboxes)
+            return torch.stack(inter_class_logits), torch.stack(inter_objectness), torch.stack(inter_pred_bboxes), torch.stack(inter_features)
 
-        return class_logits[None], objectness[None], pred_bboxes[None]
+        return class_logits[None], objectness[None], pred_bboxes[None], proposal_features[None]
 
 
 class RCNNHead(nn.Module):
@@ -278,7 +280,8 @@ class RCNNHead(nn.Module):
         bboxes_deltas = self.bboxes_delta(reg_feature)#回归偏移量
         pred_bboxes = self.apply_deltas(bboxes_deltas, bboxes.view(-1, 4))#回归偏移量应用到候选框上得到最终预测框
 
-        return class_logits.view(N, nr_boxes, -1), objectness.view(N, nr_boxes, -1), pred_bboxes.view(N, nr_boxes, -1), obj_features
+        feat = obj_features.squeeze(0).view(N, nr_boxes, self.d_model)
+        return class_logits.view(N, nr_boxes, -1), objectness.view(N, nr_boxes, -1), pred_bboxes.view(N, nr_boxes, -1), feat
 
     def apply_deltas(self, deltas, boxes):
         """

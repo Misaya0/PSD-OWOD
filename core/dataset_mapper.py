@@ -116,5 +116,12 @@ class DatasetMapper:
                 if obj.get("iscrowd", 0) == 0
             ]
             instances = utils.annotations_to_instances(annos, image_shape)
+
+            # 额外字段：把 anno['score'] 收集进 gt_scores（没有就默认 1.0）
+            scores = []
+            for a in annos:
+                scores.append(float(a.get("score", 1.0)))
+            instances.gt_scores = torch.tensor(scores, dtype=torch.float32)
+
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict
