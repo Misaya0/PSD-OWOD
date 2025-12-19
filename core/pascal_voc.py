@@ -160,20 +160,7 @@ def load_one_sam_data(num, instances, sam_file_root, image_id, tr_sz=5, tr_iou=0
         keep_indices = nms(sam_boxes, sam_scores, 0.5)  # 只保留非冗余框
         sam_boxes = sam_boxes[keep_indices]
         sam_scores = sam_scores[keep_indices]
-    # if image_id == '2008_002709':
-    #     print("aaa")
-    # if sam_boxes.shape[0] == 0:#如果SAM生成的框全部都被过滤掉
-    #     sam_boxes = torch.tensor(sam_boxes_list[0], device=device, dtype=torch.float).view(1,4)
-    #     sam_scores = torch.tensor(sam_score_list[0], device=device, dtype=torch.float).view(1)
-    #     instances.append({
-    #         "category_id": 80,
-    #         "bbox": [sam_boxes_list[0][0], sam_boxes_list[0][1],
-    #                 sam_boxes_list[0][2], sam_boxes_list[0][3]],  # xyxy
-    #         "bbox_mode": BoxMode.XYXY_ABS,
-    #         'score': sam_score_list[0]
-    #     })
-    #     return num, instances
-    # if torch.sum(valid_indices == True) > 0:
+
         if sam_scores.shape[0] > 40:  # 进行再一次筛选
             valid_indices = sam_scores >= 0.98
             sam_boxes = sam_boxes[valid_indices]

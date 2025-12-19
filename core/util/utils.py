@@ -1,5 +1,8 @@
 import torch
 from typing import List, Tuple, Union
+
+import requests
+
 from detectron2.detectron2.modeling.box_regression import Box2BoxTransform
 from detectron2.detectron2.structures import Boxes
 from detectron2.detectron2.layers import cat, ciou_loss, diou_loss
@@ -8,6 +11,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.patches as mpatches
 
+
+def send_xizhi_notification(title, content):
+    """
+    通过息知发送通知
+    :param title: 通知标题
+    :param content: 通知内容（支持 Markdown）
+    :param key: 你的息知 Key
+    """
+    url = f"https://xizhi.qqoq.net/XZd7d85ca98125ca122aff98d1771845d6.send"
+    data = {
+        "title": title,
+        "content": content
+    }
+    try:
+        response = requests.post(url, data=data)
+        if response.status_code == 200:
+            print("通知发送成功！")
+        else:
+            print(f"通知发送失败，状态码：{response.status_code}")
+    except Exception as e:
+        print(f"发送通知时出错：{e}")
 def get_centerness(anchor_centers:torch.Tensor, gt_boxes:torch.Tensor, ):
     x1g, y1g, x2g, y2g = gt_boxes.unbind(dim=-1)
     x_c, y_c = anchor_centers.unbind(dim=-1)

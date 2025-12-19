@@ -186,6 +186,29 @@ class RandBox(nn.Module):
 
         self.count = 0
 
+    def _strong_photometric(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        img: (B,3,H,W) 已经过 normalizer 的张量也可以，但更推荐对未normalize做增强。
+        这里用一个“不会改变几何”的强增强：亮度/对比度扰动 + 噪声（简单可控）
+        """
+        # 假设 img 已是 float32
+        # 亮度
+        if torch.rand(1, device=img.device) < 0.8:
+            delta = (torch.rand((img.shape[0], 1, 1, 1), device=img.device) - 0.5) * 0.2
+            img = img + delta
+
+        # 对比度
+        if torch.rand(1, device=img.device) < 0.8:
+            mean = img.mean(dim=(2, 3), keepdim=True)
+            factor = 1.0 + (torch.rand((img.shape[0], 1, 1, 1), device=img.device) - 0.5) * 0.5
+            img = (img - mean) * factor + mean
+
+        # 轻微高斯噪声
+        if torch.rand(1, device=img.device) < 0.5:
+            noise = torch.randn_like(img) * 0.03
+            img = img + noise
+
+        return img
     def predict_noise_from_start(self, x_t, t, x0):
         return (
                 (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
@@ -384,6 +407,14 @@ class RandBox(nn.Module):
             t = t.squeeze(-1)
             x_boxes = x_boxes * images_whwh[:, None, :]#将边界框坐标修正为绝对坐标
 
+            # outputs_class, output_objectness, outputs_coord, outputs_feat = self.head(features, x_boxes, t, None)
+            # output = {
+            #     'pred_logits': outputs_class[-1],
+            #     'pred_objectness': output_objectness[-1],
+            #     'pred_boxes': outputs_coord[-1],
+            #     'pred_features': outputs_feat[-1]
+            # }
+            # -------- weak view (original) --------
             outputs_class, output_objectness, outputs_coord, outputs_feat = self.head(features, x_boxes, t, None)
             output = {
                 'pred_logits': outputs_class[-1],
@@ -391,20 +422,25 @@ class RandBox(nn.Module):
                 'pred_boxes': outputs_coord[-1],
                 'pred_features': outputs_feat[-1]
             }
-            # # 将字典保存到 .txt 文件
-            # if self.count % 100 == 0:
-            #     with open('data.txt', 'a') as f:
-            #         for key, value in output.items():
-            #             # 将张量移动到 CPU 并转换为 NumPy 数组
-            #             value_cpu = value[:,:5,:].detach().cpu().numpy()
-            #             # 写入键
-            #             f.write(f"{key}:\n")
-            #             # 写入值
-            #             # np.savetxt(f, value_cpu.squeeze(), fmt='%.6f')
-            #             tensor_str =np.array2string(value_cpu.squeeze(), precision=6, separator=', ')
-            #             f.write(tensor_str)
-            #             f.write("\n")  # 添加空行分隔
-            # self.count += 1
+
+            # -------- strong view (photometric only; T is identity) --------
+            images_s = self._strong_photometric(images.tensor)
+            with torch.no_grad():
+                src_s = self.backbone(images_s)
+                features_s = []
+                for f in self.in_features:
+                    features_s.append(src_s[f])
+
+                outputs_class_s, output_objectness_s, outputs_coord_s, outputs_feat_s = self.head(features_s, x_boxes, t,
+                                                                                                  None)
+
+                output["scv"] = {
+                    "pred_logits": outputs_class_s[-1],
+                    "pred_objectness": output_objectness_s[-1],
+                    "pred_boxes": outputs_coord_s[-1],
+                    "pred_features": outputs_feat_s[-1],
+                }
+
             if self.deep_supervision:
                 output['aux_outputs'] = [{'pred_logits': a, 'pred_objectness': b, 'pred_boxes': c, 'pred_features': d}
                                          for a, b, c, d in zip(outputs_class[:-1], output_objectness[:-1], outputs_coord[:-1], outputs_feat[:-1])]

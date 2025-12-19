@@ -76,6 +76,13 @@ class SetCriterionDynamicK(nn.Module):
         self.register_buffer("ufdm_l_bg", torch.tensor(1.0))
         self.ufdm_param_m = getattr(cfg.MODEL, "UFDM_PARAM_MOMENTUM", 0.9)
 
+        # ---------------- SCV ----------------
+        self.scv_beta = getattr(cfg.MODEL, "SCV_BETA", 2.0)  # 论文 g(c)=c^beta
+        self.scv_mu = getattr(cfg.MODEL, "SCV_MOMENTUM", 0.9)  # 动量系数 mu
+        self.scv_tau_min  = getattr(cfg.MODEL, "SCV_TAU_MIN", 0.05)  # clamp 最小权重，避免全0
+        self.register_buffer("scv_mem", torch.zeros(1))  # 占位，真正的记忆用 dict 更方便
+        self._scv_mem_dict = {}  # key: (batch_idx, query_idx) -> ema_weight(float)
+
     def loss_labels(self, outputs, targets, indices):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -339,9 +346,15 @@ class SetCriterionDynamicK(nn.Module):
         feats = outputs["pred_features"]  # (bs, Q, d)
         bs, Q, d = feats.shape
         device = feats.device
+        # SCV strong-view outputs (optional)
+        scv_outputs = outputs.get("scv", None)
+        has_scv = (scv_outputs is not None) and ("pred_boxes" in scv_outputs)
+        if has_scv:
+            boxes_strong = scv_outputs["pred_boxes"]  # (bs, Q, 4) xyxy
 
         # -------- collect fg (known matched), bg (unmatched), unk (unknown matched) features --------
         fg_list, bg_list, unk_list = [], [], []
+        unk_keys = []  # aligned with F_uk samples: list of (b, q_idx)
         for b in range(bs):
             # known matched queries
             sel_k = indices[b][0]
@@ -362,6 +375,9 @@ class SetCriterionDynamicK(nn.Module):
 
             if qu.numel() > 0:
                 unk_list.append(feats[b, qu])
+                # record mapping for each unknown sample (for SCV + EMA)
+                for _qi in qu.tolist():
+                    unk_keys.append((b, int(_qi)))
 
             # background = queries not in (known matched ∪ unknown matched)
             mask_bg = torch.ones((Q,), dtype=torch.bool, device=device)
@@ -418,7 +434,7 @@ class SetCriterionDynamicK(nn.Module):
         # -------- compute unknown soft weights from fg/bg pdf ratio --------
         p_fg = self._weibull_pdf(e_uk, self.ufdm_k_fg, self.ufdm_l_fg)
         p_bg = self._weibull_pdf(e_uk, self.ufdm_k_bg, self.ufdm_l_bg)
-        r = p_fg / (p_fg + p_bg + 1e-6)  # (Nuk,)
+        r = p_fg / (p_fg + p_bg + 1e-6)  # αj
         s = torch.clamp(r ** self.ufdm_gamma, min=self.ufdm_tau_min, max=1.0)
 
         # -------- weighted unknown classification loss (paper: use soft label/weight to reweight pseudo unknown supervision) --------
@@ -464,12 +480,53 @@ class SetCriterionDynamicK(nn.Module):
                 reduction="none"
             ).sum(dim=-1)  # (Nuk,)
 
-            # apply UFDM soft weights
-            loss_nc = (per * s).mean()
+            # # apply UFDM soft weights
+            # loss_nc = (per * s).mean()
+
+            # -------- SCV fusion: omega = s * (IoU_consistency)^beta, then EMA smoothing --------
+            omega = s  # (Nuk,)
+
+            if has_scv:
+                c_list = []
+                for (bb, qq) in unk_keys:
+                    bw = outputs["pred_boxes"][bb, qq].unsqueeze(0)  # (1,4) weak box in strong coords (T=Identity)
+                    bs_all = boxes_strong[bb]  # (Q,4)
+                    ious = self._pairwise_iou_xyxy(bw, bs_all).squeeze(0)  # (Q,)
+                    c_list.append(torch.max(ious))
+                c = torch.stack(c_list, dim=0).clamp(min=0.0, max=1.0)  # (Nuk,)
+                omega = omega * torch.pow(c, self.scv_beta)
+
+            omega = omega.clamp(min=self.scv_tau_min, max=1.0)
+
+            # EMA over (b,q) as temporal stability memory
+            omega_bar_list = []
+            omega_cpu = omega.detach().float().cpu().tolist()
+            for wv, key in zip(omega_cpu, unk_keys):
+                prev = self._scv_mem_dict.get(key, wv)
+                newv = self.scv_mu * prev + (1.0 - self.scv_mu) * wv
+                self._scv_mem_dict[key] = newv
+                omega_bar_list.append(newv)
+
+            omega_bar = torch.tensor(omega_bar_list, device=device, dtype=omega.dtype).clamp(min=self.scv_tau_min,
+                                                                                             max=1.0)
+
+            # weighted mean (more stable than plain mean)
+            loss_nc = (per * omega_bar).sum() / (omega_bar.sum() + 1e-6)
 
         loss_total = loss_nc + self.ufdm_ae_weight * loss_ae
         return {"loss_ufdm": loss_total}
 
+    def _pairwise_iou_xyxy(self, boxes1, boxes2):
+        # boxes: (N,4) and (M,4) in xyxy
+        area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+        area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+
+        lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])  # (N,M,2)
+        rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])  # (N,M,2)
+        wh = (rb - lt).clamp(min=0)
+        inter = wh[:, :, 0] * wh[:, :, 1]
+        union = area1[:, None] + area2[None, :] - inter + 1e-6
+        return inter / union
     def _weibull_pdf(self, e: torch.Tensor, k: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
         # e>0
         eps = 1e-6

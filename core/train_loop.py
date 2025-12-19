@@ -10,6 +10,7 @@ import torch
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 import detectron2.detectron2.utils.comm as comm
+from core.util.utils import send_xizhi_notification
 from detectron2.detectron2.utils.events import EventStorage, get_event_storage
 from detectron2.detectron2.utils.logger import _log_api_usage
 
@@ -156,12 +157,15 @@ class TrainerBase:
                     self.before_step()
                     self.run_step()
                     self.after_step()
+                    if self.iter == max_iter - 1:
+                        send_xizhi_notification("训练结束！！！", "训练结束")
                 # self.iter == max_iter can be used by `after_train` to
                 # tell whether the training successfully finished or failed
                 # due to exceptions.
                 self.iter += 1
             except Exception:
                 logger.exception("Exception during training:")
+                send_xizhi_notification("报错了，速度上号查看！！！", "报错了，速度上号查看！！！")
                 raise
             finally:
                 self.after_train()
