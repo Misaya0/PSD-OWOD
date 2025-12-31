@@ -99,6 +99,8 @@ class RandBox(nn.Module):
         self.ddim_sampling_eta = 1.
         self.self_condition = False
         self.scale = cfg.MODEL.SNR_SCALE
+        self.ufdm = cfg.MODEL.UFDM
+        self.scv = cfg.MODEL.SCV
 
         self.register_buffer('betas', betas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
@@ -146,6 +148,10 @@ class RandBox(nn.Module):
         nc_weight = cfg.MODEL.NC_WEIGHT
         no_object_weight = cfg.MODEL.NO_OBJECT_WEIGHT
         decorr_weight = cfg.MODEL.DECORR_WEIGHT
+        ufdm_weight = cfg.MODEL.LAMADA_F
+        scv_weight = cfg.MODEL.LAMADA_U
+
+
         self.deep_supervision = cfg.MODEL.DEEP_SUPERVISION
         self.use_nms = cfg.MODEL.USE_NMS
 
@@ -154,8 +160,9 @@ class RandBox(nn.Module):
             cfg=cfg, cost_class=class_weight, cost_bbox=l1_weight, cost_giou=giou_weight
         )
         weight_dict = {"loss_ce": class_weight, "loss_bbox": l1_weight, "loss_giou": giou_weight,
-                       "loss_nc_ce": nc_weight, "loss_decorr": decorr_weight, "loss_ufdm": 1,
-                       "loss_rpn_cls":1.0, "loss_rpn_loc":1.0}
+                       "loss_nc_ce": nc_weight, "loss_decorr": decorr_weight, "loss_ufdm_scv": 1.0,
+                       "loss_ufdm": ufdm_weight,
+                       "loss_scv": scv_weight,"loss_rpn_cls":1.0, "loss_rpn_loc":1.0}
         if self.deep_supervision:
             aux_weight_dict = {}
             for i in range(self.num_heads - 1):
@@ -165,9 +172,14 @@ class RandBox(nn.Module):
         losses = ["labels", "boxes"]
         if cfg.MODEL.NC:
             losses += ["nc_labels"]
-            losses += ["ufdm"]
             # losses += ["nc_labels", "objectness"]
             # losses += ["nc_labels", "obj_likelihood"]
+        if cfg.MODEL.UFDM and cfg.MODEL.SCV:
+            losses += ['ufdm_scv']
+        elif cfg.MODEL.UFDM:
+            losses += ["ufdm"]
+        elif cfg.MODEL.SCV:
+            losses += ['scv']
         if decorr_weight > 0:
             losses += ["decorr"]
 
@@ -423,23 +435,24 @@ class RandBox(nn.Module):
                 'pred_features': outputs_feat[-1]
             }
 
-            # -------- strong view (photometric only; T is identity) --------
-            images_s = self._strong_photometric(images.tensor)
-            with torch.no_grad():
-                src_s = self.backbone(images_s)
-                features_s = []
-                for f in self.in_features:
-                    features_s.append(src_s[f])
+            if self.scv:
+                # -------- strong view (photometric only; T is identity) --------
+                images_s = self._strong_photometric(images.tensor)
+                with torch.no_grad():
+                    src_s = self.backbone(images_s)
+                    features_s = []
+                    for f in self.in_features:
+                        features_s.append(src_s[f])
 
-                outputs_class_s, output_objectness_s, outputs_coord_s, outputs_feat_s = self.head(features_s, x_boxes, t,
-                                                                                                  None)
+                    outputs_class_s, output_objectness_s, outputs_coord_s, outputs_feat_s = self.head(features_s, x_boxes, t,
+                                                                                                      None)
 
-                output["scv"] = {
-                    "pred_logits": outputs_class_s[-1],
-                    "pred_objectness": output_objectness_s[-1],
-                    "pred_boxes": outputs_coord_s[-1],
-                    "pred_features": outputs_feat_s[-1],
-                }
+                    output["scv"] = {
+                        "pred_logits": outputs_class_s[-1],
+                        "pred_objectness": output_objectness_s[-1],
+                        "pred_boxes": outputs_coord_s[-1],
+                        "pred_features": outputs_feat_s[-1],
+                    }
 
             if self.deep_supervision:
                 output['aux_outputs'] = [{'pred_logits': a, 'pred_objectness': b, 'pred_boxes': c, 'pred_features': d}

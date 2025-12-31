@@ -55,6 +55,9 @@ class SetCriterionDynamicK(nn.Module):
         self.batch_size_per_image = 256
         self.loss_weight = {'loss_rpn_cls': 0.1}
 
+        self.ufdm_weight = cfg.MODEL.LAMADA_F
+        self.scv_weight = cfg.MODEL.LAMADA_U
+
         # ---------------- UFDM (paper-aligned) ----------------
         self.ufdm_dim = hidden_dim
         self.ufdm_gamma = getattr(cfg.MODEL, "UFDM_GAMMA", 2.0)  # s = r^gamma
@@ -339,7 +342,260 @@ class SetCriterionDynamicK(nn.Module):
         #     return {'loss_pos_obj_ll': loss_pos_obj_ll * lr_decay, 'loss_neg_obj_ll': loss_neg_obj_ll * lr_decay,
         #             'loss_pseudo_obj_ll': loss_pseudo_obj_ll * lr_decay}
 
+    def loss_scv(self, outputs, targets, indices, owod_targets, owod_indices):
+        """
+        Pure SCV loss:
+          - No UFDM AE / Weibull / bg sampling
+          - Use box IoU consistency between weak and strong views to weight unknown focal loss
+          - EMA smoothing on weights for stability
+        Returns:
+          {"loss_scv": scalar}
+        """
+        # basic guards
+        if ("pred_boxes" not in outputs) or ("pred_logits" not in outputs) or (owod_targets is None) or (
+                len(owod_indices) == 0):
+            # keep graph-safe zero
+            z = outputs["pred_boxes"].sum() * 0.0 if "pred_boxes" in outputs else torch.tensor(0.0, device=next(
+                iter(outputs.values())).device)
+            return {"loss_scv": z}
+
+        feats_device = outputs["pred_boxes"].device
+        bs, Q = outputs["pred_boxes"].shape[:2]
+
+        # strong-view outputs (optional)
+        scv_outputs = outputs.get("scv", None)
+        has_scv = (scv_outputs is not None) and ("pred_boxes" in scv_outputs)
+
+        # build logits (consistent with your existing disentangled option)
+        if self.disentangled == 0:
+            logits = outputs["pred_logits"]  # (bs,Q,C)
+        else:
+            assert "pred_objectness" in outputs
+            src_prob = torch.softmax(outputs["pred_logits"], dim=-1) * outputs["pred_objectness"]
+            logits = torch.log(src_prob / (1.0 - src_prob + 1e-6))
+
+        # gather unknown matched logits and targets + record (b, q) keys
+        logit_list, tgt_list = [], []
+        unk_keys = []  # list[(b, q_idx)] aligned with per-sample loss
+
+        for b in range(bs):
+            sel_u = owod_indices[b][0]  # selected queries for unknown
+            gt_i = owod_indices[b][1]  # matched gt indices in owod_targets[b]
+
+            if sel_u is None or gt_i is None:
+                continue
+
+            if sel_u.dtype == torch.bool:
+                qu = torch.nonzero(sel_u, as_tuple=False).squeeze(1)
+            else:
+                qu = sel_u
+
+            if (qu.numel() == 0) or (gt_i.numel() == 0):
+                continue
+
+            logit_list.append(logits[b, qu])  # (nu, C)
+            y = owod_targets[b]["labels"][gt_i]  # usually all 80 for unknown in your split
+            tgt_list.append(y)
+
+            for _qi in qu.tolist():
+                unk_keys.append((b, int(_qi)))
+
+        if len(logit_list) == 0:
+            return {"loss_scv": logits.sum() * 0.0}
+
+        L = torch.cat(logit_list, dim=0)  # (Nuk, C)
+        y = torch.cat(tgt_list, dim=0)  # (Nuk,)
+        C = L.shape[-1]
+
+        y_onehot = torch.zeros((L.shape[0], C), device=feats_device, dtype=L.dtype)
+        y_onehot.scatter_(1, y.unsqueeze(1), 1.0)
+
+        # per-sample focal loss (sum over classes -> (Nuk,))
+        per = sigmoid_focal_loss_jit(
+            L, y_onehot,
+            alpha=self.focal_loss_alpha,
+            gamma=self.focal_loss_gamma,
+            reduction="none"
+        ).sum(dim=-1)
+
+        # -------- SCV weight omega from IoU consistency --------
+        omega = torch.ones_like(per)
+
+        if has_scv:
+            weak_boxes = outputs["pred_boxes"].detach()  # (bs,Q,4) xyxy
+            strong_boxes = scv_outputs["pred_boxes"].detach()  # (bs,Q,4) xyxy
+
+            c_list = []
+            for (bb, qq) in unk_keys:
+                bw = weak_boxes[bb, qq].unsqueeze(0)  # (1,4)
+                bs_all = strong_boxes[bb]  # (Q,4)
+
+                # to be robust, use max IoU over all queries (keeps your previous behavior)
+                ious = self._pairwise_iou_xyxy(bw, bs_all).squeeze(0)  # (Q,)
+                c_list.append(torch.max(ious))
+
+            c = torch.stack(c_list, dim=0).clamp(min=0.0, max=1.0)  # (Nuk,)
+            omega = torch.pow(c, self.scv_beta)
+
+        omega = omega.clamp(min=self.scv_tau_min, max=1.0)
+
+        # -------- EMA smoothing on omega (keyed by (b,q)) --------
+        omega_bar_list = []
+        omega_cpu = omega.detach().float().cpu().tolist()
+
+        for wv, key in zip(omega_cpu, unk_keys):
+            prev = self._scv_mem_dict.get(key, wv)
+            newv = self.scv_mu * prev + (1.0 - self.scv_mu) * wv
+            self._scv_mem_dict[key] = newv
+            omega_bar_list.append(newv)
+
+        omega_bar = torch.tensor(
+            omega_bar_list, device=feats_device, dtype=omega.dtype
+        ).clamp(min=self.scv_tau_min, max=1.0)
+
+        # weighted mean (numerically stable)
+        loss_scv = (per * omega_bar).sum() / (omega_bar.sum() + 1e-6)
+
+        return {"loss_scv": loss_scv}
+
     def loss_ufdm(self, outputs, targets, indices, owod_targets, owod_indices):
+        if ("pred_features" not in outputs) or (owod_targets is None) or (len(owod_indices) == 0):
+            return {"loss_ufdm": outputs["pred_boxes"].sum() * 0.0}
+
+        feats = outputs["pred_features"]  # (bs, Q, d)
+        bs, Q, d = feats.shape
+        device = feats.device
+
+        # -------- collect fg (known matched), bg (unmatched), unk (unknown matched) features --------
+        fg_list, bg_list, unk_list = [], [], []
+        for b in range(bs):
+            # known matched queries
+            sel_k = indices[b][0]
+            if sel_k.dtype == torch.bool:
+                qk = torch.nonzero(sel_k, as_tuple=False).squeeze(1)
+            else:
+                qk = sel_k
+
+            # unknown matched queries
+            sel_u = owod_indices[b][0]
+            if sel_u.dtype == torch.bool:
+                qu = torch.nonzero(sel_u, as_tuple=False).squeeze(1)
+            else:
+                qu = sel_u
+
+            if qk.numel() > 0:
+                fg_list.append(feats[b, qk])
+
+            if qu.numel() > 0:
+                unk_list.append(feats[b, qu])
+
+            # background = queries not in (known matched ∪ unknown matched)
+            mask_bg = torch.ones((Q,), dtype=torch.bool, device=device)
+            if qk.numel() > 0:
+                mask_bg[qk] = False
+            if qu.numel() > 0:
+                mask_bg[qu] = False
+            qb = torch.nonzero(mask_bg, as_tuple=False).squeeze(1)
+
+            if qb.numel() > 0:
+                # sample a fixed number for stability
+                m = min(qb.numel(), self.ufdm_bg_samples)
+                qb = qb[torch.randperm(qb.numel(), device=device)[:m]]
+                bg_list.append(feats[b, qb])
+
+        if (len(unk_list) == 0) or (len(fg_list) == 0) or (len(bg_list) == 0):
+            return {"loss_ufdm": outputs["pred_boxes"].sum() * 0.0}
+
+        F_fg = torch.cat(fg_list, dim=0)  # (Nfg, d)
+        F_bg = torch.cat(bg_list, dim=0)  # (Nbg, d)
+        F_uk = torch.cat(unk_list, dim=0)  # (Nuk, d)
+
+        # -------- AE forward & reconstruction error --------
+        def ae_recon(x):
+            z = self.ufdm_enc(x)
+            xh = self.ufdm_dec(z)
+            return xh
+
+        # normalize feature like paper’s “object-level features” typically stabilized
+        F_fg_n = F.normalize(F_fg, dim=-1)
+        F_bg_n = F.normalize(F_bg, dim=-1)
+        F_uk_n = F.normalize(F_uk, dim=-1)
+
+        R_fg = ae_recon(F_fg_n)
+        R_bg = ae_recon(F_bg_n)
+        R_uk = ae_recon(F_uk_n)
+
+        # reconstruction error: L2 norm per sample
+        e_fg = torch.norm(F_fg_n - R_fg, dim=-1)  # (Nfg,)
+        e_bg = torch.norm(F_bg_n - R_bg, dim=-1)  # (Nbg,)
+        e_uk = torch.norm(F_uk_n - R_uk, dim=-1)  # (Nuk,)
+
+        # AE loss (train AE)
+        loss_ae = (
+                F.mse_loss(R_fg, F_fg_n, reduction="mean") +
+                F.mse_loss(R_bg, F_bg_n, reduction="mean") +
+                F.mse_loss(R_uk, F_uk_n, reduction="mean")
+        )
+
+        # -------- fit/update Weibull params (EMA) --------
+        with torch.no_grad():
+            self._update_weibull_params(e_fg, e_bg)
+
+        # -------- compute unknown soft weights from fg/bg pdf ratio --------
+        p_fg = self._weibull_pdf(e_uk, self.ufdm_k_fg, self.ufdm_l_fg)
+        p_bg = self._weibull_pdf(e_uk, self.ufdm_k_bg, self.ufdm_l_bg)
+        r = p_fg / (p_fg + p_bg + 1e-6)  # (Nuk,)
+        s = torch.clamp(r ** self.ufdm_gamma, min=self.ufdm_tau_min, max=1.0)
+
+        # -------- weighted unknown classification loss (paper: use soft label/weight to reweight pseudo unknown supervision) --------
+        # build logits for the matched unknown queries
+        if self.disentangled == 0:
+            logits = outputs["pred_logits"]  # (bs,Q,C)
+        else:
+            src_prob = torch.softmax(outputs["pred_logits"], dim=-1) * outputs["pred_objectness"]
+            logits = torch.log(src_prob / (1 - src_prob + 1e-6))
+
+        # gather unknown matched logits and targets
+        logit_list = []
+        tgt_list = []
+        for b in range(bs):
+            sel_u = owod_indices[b][0]
+            gt_i = owod_indices[b][1]
+            if sel_u.dtype == torch.bool:
+                qu = torch.nonzero(sel_u, as_tuple=False).squeeze(1)
+            else:
+                qu = sel_u
+            if (qu.numel() == 0) or (gt_i.numel() == 0):
+                continue
+            logit_list.append(logits[b, qu])  # (nu, C)
+
+            # labels from unknown targets
+            y = owod_targets[b]["labels"][gt_i]  # usually all 80
+            tgt_list.append(y)
+
+        if len(logit_list) == 0:
+            loss_nc = logits.sum() * 0.0
+        else:
+            L = torch.cat(logit_list, dim=0)  # (Nuk, C)
+            y = torch.cat(tgt_list, dim=0)  # (Nuk,)
+            C = L.shape[-1]
+            y_onehot = torch.zeros((L.shape[0], C), device=device, dtype=L.dtype)
+            y_onehot.scatter_(1, y.unsqueeze(1), 1.0)
+
+            # focal loss per-sample
+            per = sigmoid_focal_loss_jit(
+                L, y_onehot,
+                alpha=self.focal_loss_alpha,
+                gamma=self.focal_loss_gamma,
+                reduction="none"
+            ).sum(dim=-1)  # (Nuk,)
+
+            # apply UFDM soft weights
+            loss_nc = (per * s).mean()
+
+        loss_total = loss_nc + self.ufdm_ae_weight * loss_ae
+        return {"loss_ufdm": loss_total}
+    def loss_ufdm_scv(self, outputs, targets, indices, owod_targets, owod_indices):
         if ("pred_features" not in outputs) or (owod_targets is None) or (len(owod_indices) == 0):
             return {"loss_ufdm": outputs["pred_boxes"].sum() * 0.0}
 
@@ -513,7 +769,7 @@ class SetCriterionDynamicK(nn.Module):
             # weighted mean (more stable than plain mean)
             loss_nc = (per * omega_bar).sum() / (omega_bar.sum() + 1e-6)
 
-        loss_total = loss_nc + self.ufdm_ae_weight * loss_ae
+        loss_total = loss_nc * self.scv_weight + self.ufdm_ae_weight * loss_ae * self.ufdm_weight
         return {"loss_ufdm": loss_total}
 
     def _pairwise_iou_xyxy(self, boxes1, boxes2):
@@ -600,11 +856,13 @@ class SetCriterionDynamicK(nn.Module):
             'decorr': self.loss_decorr,
             # 'obj_likelihood': self.loss_obj_likelihood
             'ufdm': self.loss_ufdm,
+            'scv': self.loss_scv,
+            'ufdm_scv': self.loss_ufdm_scv,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         if loss == 'obj_likelihood':
             return loss_map[loss](outputs, targets, indices, num_boxes, num_pseudo_boxes, lvl, owod_targets, owod_indices, **kwargs)
-        elif loss == 'ufdm':
+        elif loss in ('ufdm', 'scv', 'ufdm_scv'):
             return loss_map[loss](outputs, targets, indices, owod_targets, owod_indices)
         return loss_map[loss](outputs, targets, indices)
     def _filter_invalid(self, boxes):
@@ -818,7 +1076,7 @@ class SetCriterionDynamicK(nn.Module):
             if loss == 'nc_labels':
                 if self.start_count > self.start_iter:
                     losses.update(self.get_loss(loss, outputs, unknown_targets, ow_indices, num_boxes, num_pseudo_boxes, 5,  unknown_targets, new_ow_indices))
-            elif loss == 'ufdm':
+            elif loss in ('ufdm', 'scv', 'ufdm_scv'):
                 # UFDM：必须用 unknown_targets + ow_indices（不能用 new_ow_indices）
                 if self.start_count > self.start_iter:
                     losses.update(self.get_loss(loss, outputs, targets, indices,
@@ -845,7 +1103,7 @@ class SetCriterionDynamicK(nn.Module):
                     #                           gt_boxes, soft_labels, gt_classes)
                         l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                         losses.update(l_dict)
-                    elif loss == 'ufdm':
+                    elif loss in ('ufdm', 'scv', 'ufdm_scv'):
                         l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, num_pseudo_boxes, 5, unknown_targets, ow_indices)
                         l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                         losses.update(l_dict)

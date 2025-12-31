@@ -30,6 +30,10 @@ def add_config(cfg,args):
     cfg.MODEL.L1_WEIGHT = 5.0
     cfg.MODEL.DEEP_SUPERVISION = True
     cfg.MODEL.NO_OBJECT_WEIGHT = 0.1
+    cfg.MODEL.UFDM = False
+    cfg.MODEL.SCV = True
+    cfg.MODEL.LAMADA_U = 0.1 # λ_U  SCV
+    cfg.MODEL.LAMADA_F = 1.0 # λ_F  UFDM
 
     # Focal Loss.
     cfg.MODEL.ALPHA = 0.25

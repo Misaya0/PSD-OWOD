@@ -9,6 +9,8 @@ from collections import OrderedDict, defaultdict
 from functools import lru_cache
 import torch
 from fvcore.common.file_io import PathManager
+
+from core.util.utils import send_xizhi_notification
 from detectron2.detectron2.data import MetadataCatalog
 from detectron2.detectron2.utils import comm
 from detectron2.detectron2.evaluation.evaluator import DatasetEvaluator
@@ -238,6 +240,13 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         self._logger.info("Unknown AP50: " + str(aps[50][-1]))
         self._logger.info("Unknown Precisions50: " + str(precs[50][-1]))
         self._logger.info("Unknown Recall50: " + str(recs[50][-1]))
+        s = ""
+        if self.prev_intro_cls > 0:
+            s += "Prev class AP50: " + str(np.mean(aps[50][:self.prev_intro_cls]))
+        s += "Current class AP50: " + str(
+            np.mean(aps[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])) + "Unknown Recall50:" + str(recs[50][-1])
+        send_xizhi_notification("训练结束！！！", s)
+
         # self._logger.info("Unknown AP75: " + str(aps[75][-1]))
 
         # self._logger.info("R__: " + str(['%.1f' % x for x in list(np.mean([x for _, x in recs.items()], axis=0))]))

@@ -102,14 +102,14 @@ class Trainer(DefaultTrainer):
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
-        model = create_ddp_model(model, broadcast_buffers=False)
+        model = create_ddp_model(model, broadcast_buffers=False, find_unused_parameters=True)
         # self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
         #     model, data_loader, optimizer, rew_model=self.rew_model
         # )
         if cfg.SOLVER.AMP.ENABLED:
             self._trainer = AMPTrainer(model, data_loader, optimizer)
         else:
-            self._trainer = SimpleTrainer(model, data_loader, optimizer, rew_model=self.rew_model)
+            self._trainer = SimpleTrainer(model, data_loader, optimizer)
 
         self.scheduler = self.build_lr_scheduler(cfg, optimizer)
 
@@ -380,7 +380,7 @@ def main(args):
 
 
 
-    trainer = Trainer(cfg, args, rew_cfg)
+    trainer = Trainer(cfg, args)
     trainer.resume_or_load(resume=args.resume)
     return trainer.train()
 
